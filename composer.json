@@ -1,0 +1,49 @@
+{
+    "name": "cyberwizard/schedule-catchup",
+    "description": "Automatic post-downtime catch-up for missed Laravel scheduled events.",
+    "keywords": [
+        "laravel",
+        "scheduler",
+        "schedule",
+        "catchup",
+        "downtime"
+    ],
+    "license": "MIT",
+    "type": "library",
+    "require": {
+        "php": "^8.2",
+        "dragonmantank/cron-expression": "^3.3",
+        "illuminate/console": "^11.0|^12.0|^13.0",
+        "illuminate/database": "^11.0|^12.0|^13.0",
+        "illuminate/support": "^11.0|^12.0|^13.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0|^11.0",
+        "phpunit/phpunit": "^10.5|^11.0|^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Cyberwizard\\ScheduleCatchup\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Cyberwizard\\ScheduleCatchup\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Cyberwizard\\ScheduleCatchup\\Console\\ScheduleCatchupServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "scripts": {
+        "test": "phpunit"
+    }
+}
