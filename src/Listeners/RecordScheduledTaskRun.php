@@ -7,11 +7,31 @@ use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupLog;
 use Cyberwizard\ScheduleCatchup\Support\ScheduleEventKey;
 use Cyberwizard\ScheduleCatchup\Support\ScheduleReplayRegistry;
 use Illuminate\Console\Events\ScheduledTaskFinished;
+use Illuminate\Console\Events\ScheduledTaskStarting;
 use Illuminate\Database\QueryException;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Log;
+use WeakMap;
 
 class RecordScheduledTaskRun
 {
+    /** Slot each running task started for, so a long run is not credited to a later slot. */
+    private static ?WeakMap $startedFor = null;
+
+    public function starting(ScheduledTaskStarting $event): void
+    {
+        if (! ScheduleReplayRegistry::isTagged($event->task)) {
+            return;
+        }
+
+        try {
+            self::$startedFor ??= new WeakMap;
+            self::$startedFor[$event->task] = $this->slotFor($event->task);
+        } catch (\Throwable $e) {
+            return;
+        }
+    }
+
     /**
      * Records every normal run of a replayable event against the slot it satisfied.
      *
@@ -27,7 +47,8 @@ class RecordScheduledTaskRun
         }
 
         try {
-            $slot = $this->slotFor($task);
+            $slot = self::$startedFor[$task] ?? $this->slotFor($task);
+            unset(self::$startedFor[$task]);
         } catch (\Throwable $e) {
             return;
         }
@@ -45,10 +66,10 @@ class RecordScheduledTaskRun
                     'attempts' => 1,
                 ]
             );
+        } catch (UniqueConstraintViolationException) {
+            return;
         } catch (QueryException $e) {
-            if ((int) $e->getCode() !== 23000) {
-                Log::warning('Failed to record scheduled task run', ['error' => $e->getMessage()]);
-            }
+            Log::warning('Failed to record scheduled task run', ['error' => $e->getMessage()]);
         }
     }
 

@@ -4,9 +4,11 @@ namespace Cyberwizard\ScheduleCatchup\Console;
 
 use Cyberwizard\ScheduleCatchup\Console\Commands\ScheduleCatchupCommand;
 use Cyberwizard\ScheduleCatchup\Console\Commands\ScheduleHeartbeatCommand;
+use Cyberwizard\ScheduleCatchup\Console\Commands\SchedulePruneCommand;
 use Cyberwizard\ScheduleCatchup\Listeners\RecordScheduledTaskRun;
 use Cyberwizard\ScheduleCatchup\Support\ScheduleReplayRegistry;
 use Illuminate\Console\Events\ScheduledTaskFinished;
+use Illuminate\Console\Events\ScheduledTaskStarting;
 use Illuminate\Console\Scheduling\Event;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\Event as EventFacade;
@@ -26,6 +28,7 @@ class ScheduleCatchupServiceProvider extends ServiceProvider
             return $this;
         });
 
+        EventFacade::listen(ScheduledTaskStarting::class, [RecordScheduledTaskRun::class, 'starting']);
         EventFacade::listen(ScheduledTaskFinished::class, RecordScheduledTaskRun::class);
 
         $this->publishes([
@@ -48,12 +51,17 @@ class ScheduleCatchupServiceProvider extends ServiceProvider
                 ->everyFiveMinutes()
                 ->withoutOverlapping()
                 ->onOneServer();
+
+            $schedule->command(SchedulePruneCommand::class)
+                ->dailyAt('04:10')
+                ->onOneServer();
         });
 
         if ($this->app->runningInConsole()) {
             $this->commands([
                 ScheduleCatchupCommand::class,
                 ScheduleHeartbeatCommand::class,
+                SchedulePruneCommand::class,
             ]);
         }
     }

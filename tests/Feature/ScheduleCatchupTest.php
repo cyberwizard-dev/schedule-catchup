@@ -207,7 +207,10 @@ class ScheduleCatchupTest extends TestCase
         $this->artisan('schedule-catchup:run')->assertExitCode(0);
 
         $this->assertSame(0, $ran);
-        $this->assertSame(0, SchedulerCatchupLog::where('command', 'test:overlap')->count(), 'An overlap skip must not retire the occurrence.');
+        $owed = SchedulerCatchupLog::where('command', 'test:overlap')->sole();
+        $this->assertNull($owed->exit_code, 'An overlap skip must not retire the occurrence.');
+        $this->assertSame(0, $owed->attempts);
+        $this->assertFalse($owed->isSettled(3));
         $this->assertSame($lastTick, SchedulerCatchupCheckpoint::get('last_tick'));
 
         $event->mutex->forget($event);

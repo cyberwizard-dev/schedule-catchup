@@ -8,6 +8,7 @@ use Cyberwizard\ScheduleCatchup\Events\ScheduleCatchupCompleted;
 use Cyberwizard\ScheduleCatchup\Events\ScheduleCatchupFailed;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupCheckpoint;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupLog;
+use Cyberwizard\ScheduleCatchup\Models\SchedulerOutage;
 use Cyberwizard\ScheduleCatchup\Support\ScheduleEventKey;
 use Cyberwizard\ScheduleCatchup\Support\ScheduleReplayRegistry;
 use Illuminate\Console\Command;
@@ -30,6 +31,9 @@ class ScheduleCatchupCommand extends Command
 
     protected bool $capHit = false;
 
+    /** Whether the current event's walk stopped at the occurrence cap. */
+    protected bool $eventCapHit = false;
+
     protected int $maxAttempts = 3;
 
     /** @var array<int, string> */
@@ -45,7 +49,8 @@ class ScheduleCatchupCommand extends Command
     {
         $this->maxAttempts = max(1, (int) config('schedule-catchup.max_attempts', 3));
 
-        $lock = Cache::store(config('schedule-catchup.cache_driver'))->lock('schedule-catchup:run', 600);
+        $lock = Cache::store(config('schedule-catchup.cache_driver'))
+            ->lock('schedule-catchup:run', max(60, (int) config('schedule-catchup.lock_seconds', 3600)));
 
         if (! $lock->get()) {
             $this->warn('Another catch-up run is already in progress. Skipping this run.');
@@ -81,6 +86,10 @@ class ScheduleCatchupCommand extends Command
         $events = $this->replayableEvents();
         $gapMinutes = (int) $lastTick->diffInMinutes(now());
 
+        if (! $this->option('dry-run') && $gapMinutes >= max(1, (int) config('schedule-catchup.outage_after_minutes', 10))) {
+            SchedulerOutage::record($lastTick, now());
+        }
+
         if (! $this->option('force') && $gapMinutes < config('schedule-catchup.min_gap_minutes', 2)) {
             // Below the threshold the replay work is skipped, but the checkpoint may only move
             // forward once we know nothing fell inside the window we are about to step over.
@@ -100,8 +109,10 @@ class ScheduleCatchupCommand extends Command
 
         foreach ($events as $event) {
             $resumeFrom = $this->resumePoint($event, $lastTick);
+            $this->eventCapHit = false;
+            $occurrences = $this->occurrencesToReplay($event, $resumeFrom);
 
-            foreach ($this->occurrencesToReplay($event, $resumeFrom) as $scheduledAt) {
+            foreach ($occurrences as $scheduledAt) {
                 if ($this->option('dry-run')) {
                     $this->line("[dry-run] Would replay [{$event->getSummaryForDisplay()}] scheduled at {$scheduledAt->toDateTimeString()}.");
                     $skipped++;
@@ -110,6 +121,15 @@ class ScheduleCatchupCommand extends Command
                 }
 
                 if (! $this->serverShouldReplay($event, $scheduledAt)) {
+                    $skipped++;
+
+                    continue;
+                }
+
+                // Its ->when()/->skip() conditions or environments say the
+                // normal run would not have happened either.
+                if (! $this->overlapping($event) && ! $this->conditionsPass($event)) {
+                    $this->line("Skipped [{$event->getSummaryForDisplay()}] at {$scheduledAt->toDateTimeString()}: its conditions do not pass.");
                     $skipped++;
 
                     continue;
@@ -134,6 +154,10 @@ class ScheduleCatchupCommand extends Command
                 } else {
                     $failed++;
                 }
+            }
+
+            if (! $this->option('dry-run')) {
+                $this->saveCursor($event, $occurrences);
             }
         }
 
@@ -198,6 +222,13 @@ class ScheduleCatchupCommand extends Command
 
     protected function resumePoint(Event $event, Carbon $lastTick): Carbon
     {
+        // A walk cut short by the cap resumes where it stopped, even though the
+        // heartbeat has since moved the last tick past it.
+        $cursor = SchedulerCatchupCheckpoint::get($this->cursorKey($event));
+        if ($cursor) {
+            return Carbon::parse($cursor);
+        }
+
         $lastLogged = SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))
             ->max('scheduled_at');
 
@@ -221,7 +252,7 @@ class ScheduleCatchupCommand extends Command
      */
     protected function occurrencesToReplay(Event $event, Carbon $resumeFrom): array
     {
-        $settled = $this->settledSlots($event);
+        $settled = $this->settledSlots($event, $resumeFrom);
 
         $candidates = collect($this->missedOccurrences($event, $resumeFrom))
             ->concat($this->pendingSlots($event))
@@ -236,9 +267,10 @@ class ScheduleCatchupCommand extends Command
     /**
      * @return array<int, string>
      */
-    protected function settledSlots(Event $event): array
+    protected function settledSlots(Event $event, Carbon $from): array
     {
         return SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))
+            ->where('scheduled_at', '>=', $from->toDateTimeString())
             ->where(fn ($query) => $query->where('exit_code', 0)->orWhere('attempts', '>=', $this->maxAttempts))
             ->pluck('scheduled_at')
             ->map(fn ($slot) => Carbon::parse($slot)->toDateTimeString())
@@ -282,6 +314,7 @@ class ScheduleCatchupCommand extends Command
 
         if (count($occurrences) === $cap && $cron->getNextRunDate($cursor, 0, false, $event->timezone) < $windowEnd) {
             $this->capHit = true;
+            $this->eventCapHit = true;
         }
 
         return $occurrences;
@@ -305,12 +338,57 @@ class ScheduleCatchupCommand extends Command
         }
     }
 
+    protected function overlapping(Event $event): bool
+    {
+        return $event->withoutOverlapping && $event->mutex->exists($event);
+    }
+
+    protected function conditionsPass(Event $event): bool
+    {
+        try {
+            return $event->runsInEnvironment($this->laravel->environment()) && $event->filtersPass($this->laravel);
+        } catch (Throwable $e) {
+            return true;
+        }
+    }
+
+    protected function cursorKey(Event $event): string
+    {
+        return 'cursor:'.ScheduleEventKey::for($event);
+    }
+
+    /**
+     * Remembers where a capped walk stopped so the rest is replayed on the next run, and
+     * forgets it once the event has caught up.
+     *
+     * @param  array<int, Carbon>  $occurrences
+     */
+    protected function saveCursor(Event $event, array $occurrences): void
+    {
+        $key = $this->cursorKey($event);
+
+        if ($this->eventCapHit && $occurrences !== []) {
+            SchedulerCatchupCheckpoint::set($key, end($occurrences)->toDateTimeString());
+
+            return;
+        }
+
+        if (SchedulerCatchupCheckpoint::get($key) !== null) {
+            SchedulerCatchupCheckpoint::query()->where('key', $key)->delete();
+        }
+    }
+
     /**
      * @return 'replayed'|'deferred'|'failed'
      */
     protected function replayEvent(Event $event, Carbon $scheduledAt): string
     {
         $this->setScheduledTime($scheduledAt);
+
+        // A background run returns before the command finishes, so its exit code
+        // would read as success. Replays run in the foreground.
+        $background = $event->runInBackground;
+        $event->runInBackground = false;
 
         try {
             $event->run($this->laravel);
@@ -321,13 +399,17 @@ class ScheduleCatchupCommand extends Command
 
             return 'failed';
         } finally {
+            $event->runInBackground = $background;
             $this->clearScheduledTime();
         }
 
         // An overlapping run returns from Event::run() without ever setting an exit code. Logging
         // that as a success would retire the occurrence permanently even though nothing ran.
+        // It is logged as still owed, so the next run retries it even after the heartbeat has
+        // moved the last tick past it.
         if ($event->skippedBecauseOverlapping) {
             $this->warn("Replay of [{$event->getSummaryForDisplay()}] at {$scheduledAt->toDateTimeString()} was skipped because the command is already running; it will be retried.");
+            $this->recordDeferred($event, $scheduledAt);
 
             return 'deferred';
         }
@@ -393,6 +475,26 @@ class ScheduleCatchupCommand extends Command
         if ($wasFirstAttempt) {
             $this->newFailures[] = $label;
         }
+    }
+
+    protected function recordDeferred(Event $event, Carbon $scheduledAt): void
+    {
+        $log = SchedulerCatchupLog::firstOrNew([
+            'command' => ScheduleEventKey::for($event),
+            'scheduled_at' => $scheduledAt->toDateTimeString(),
+        ]);
+
+        if ($log->exists) {
+            return;
+        }
+
+        $log->fill([
+            'source' => 'catchup',
+            'ran_at' => now()->toDateTimeString(),
+            'exit_code' => null,
+            'attempts' => 0,
+            'last_error' => 'Deferred: the command was already running.',
+        ])->save();
     }
 
     protected function setScheduledTime(Carbon $scheduledAt): void

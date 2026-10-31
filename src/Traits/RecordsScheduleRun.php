@@ -4,36 +4,49 @@ namespace Cyberwizard\ScheduleCatchup\Traits;
 
 use Closure;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCommandRun;
-use Illuminate\Database\QueryException;
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Support\Facades\Cache;
 
 trait RecordsScheduleRun
 {
+    /**
+     * Runs $callback once per command and period. A lock covers the check, the work and the
+     * record, so a normal run and a replay that overlap cannot both do the work. Exceptions
+     * from the work itself, duplicate-key ones included, reach the caller.
+     */
     public function runOnceForPeriod(string $periodKey, Closure $callback): bool
     {
-        $existing = SchedulerCommandRun::where('command', static::class)
-            ->where('period_key', $periodKey)
-            ->exists();
+        $lock = Cache::store(config('schedule-catchup.cache_driver'))
+            ->lock('schedule-catchup:once:'.sha1(static::class.'|'.$periodKey), 6 * 3600);
 
-        if ($existing) {
+        if (! $lock->get()) {
             return false;
         }
 
         try {
-            $callback();
+            $existing = SchedulerCommandRun::where('command', static::class)
+                ->where('period_key', $periodKey)
+                ->exists();
 
-            SchedulerCommandRun::create([
-                'command' => static::class,
-                'period_key' => $periodKey,
-                'ran_at' => now(),
-            ]);
-
-            return true;
-        } catch (QueryException $e) {
-            if ((int) $e->getCode() !== 23000) {
-                throw $e;
+            if ($existing) {
+                return false;
             }
 
-            return false;
+            $callback();
+
+            try {
+                SchedulerCommandRun::create([
+                    'command' => static::class,
+                    'period_key' => $periodKey,
+                    'ran_at' => now(),
+                ]);
+            } catch (UniqueConstraintViolationException) {
+                return false;
+            }
+
+            return true;
+        } finally {
+            $lock->release();
         }
     }
 }
