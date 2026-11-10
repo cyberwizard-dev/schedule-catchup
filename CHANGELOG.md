@@ -2,6 +2,12 @@
 
 Notable changes to `cyberwizard/schedule-catchup` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-11-10
+
+### Fixed
+
+- Replays crashed on Laravel 12 and older with `Undefined property: CallbackEvent::$skippedBecauseOverlapping`. That flag only exists on Laravel 13; older versions now detect an overlapping replay by checking the event's mutex before running it.
+
 ## [1.2.0] - 2026-11-10
 
 ### Added

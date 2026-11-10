@@ -398,6 +398,9 @@ class ScheduleCatchupCommand extends Command
         $background = $event->runInBackground;
         $event->runInBackground = false;
 
+        // Laravel 12 and older have no skippedBecauseOverlapping flag, so the mutex is checked
+        // up front and used when the flag is missing.
+        $wasOverlapping = $this->overlapping($event);
         $startedAt = microtime(true);
 
         try {
@@ -418,7 +421,11 @@ class ScheduleCatchupCommand extends Command
         // that as a success would retire the occurrence permanently even though nothing ran.
         // It is logged as still owed, so the next run retries it even after the heartbeat has
         // moved the last tick past it.
-        if ($event->skippedBecauseOverlapping) {
+        $skippedBecauseOverlapping = property_exists($event, 'skippedBecauseOverlapping')
+            ? (bool) $event->skippedBecauseOverlapping
+            : $wasOverlapping;
+
+        if ($skippedBecauseOverlapping) {
             $this->warn("Replay of [{$event->getSummaryForDisplay()}] at {$scheduledAt->toDateTimeString()} was skipped because the command is already running; it will be retried.");
             $this->recordDeferred($event, $scheduledAt);
 
