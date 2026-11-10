@@ -2,6 +2,13 @@
 
 Notable changes to `cyberwizard/schedule-catchup` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-10
+
+### Added
+
+- Per-occurrence events so listeners can report each replay outcome: `ScheduleOccurrenceReplayed` (exit code and runtime in seconds), `ScheduleOccurrenceFailed` (fired on every failed attempt, with attempt count and an `exhausted` flag once `max_attempts` is reached) and `ScheduleOccurrenceDeferred`.
+- `ScheduleOutageRecorded`, fired when a new outage row is created.
+
 ## [1.1.0] - 2026-10-31
 
 ### Added

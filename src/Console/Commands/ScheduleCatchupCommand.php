@@ -6,6 +6,10 @@ use Carbon\Carbon;
 use Cron\CronExpression;
 use Cyberwizard\ScheduleCatchup\Events\ScheduleCatchupCompleted;
 use Cyberwizard\ScheduleCatchup\Events\ScheduleCatchupFailed;
+use Cyberwizard\ScheduleCatchup\Events\ScheduleOccurrenceDeferred;
+use Cyberwizard\ScheduleCatchup\Events\ScheduleOccurrenceFailed;
+use Cyberwizard\ScheduleCatchup\Events\ScheduleOccurrenceReplayed;
+use Cyberwizard\ScheduleCatchup\Events\ScheduleOutageRecorded;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupCheckpoint;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupLog;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerOutage;
@@ -87,7 +91,11 @@ class ScheduleCatchupCommand extends Command
         $gapMinutes = (int) $lastTick->diffInMinutes(now());
 
         if (! $this->option('dry-run') && $gapMinutes >= max(1, (int) config('schedule-catchup.outage_after_minutes', 10))) {
-            SchedulerOutage::record($lastTick, now());
+            $outage = SchedulerOutage::record($lastTick, now());
+
+            if ($outage->wasRecentlyCreated) {
+                event(new ScheduleOutageRecorded($outage));
+            }
         }
 
         if (! $this->option('force') && $gapMinutes < config('schedule-catchup.min_gap_minutes', 2)) {
@@ -390,9 +398,12 @@ class ScheduleCatchupCommand extends Command
         $background = $event->runInBackground;
         $event->runInBackground = false;
 
+        $startedAt = microtime(true);
+
         try {
             $event->run($this->laravel);
             $exitCode = $event->exitCode;
+            $runtime = microtime(true) - $startedAt;
         } catch (Throwable $e) {
             $this->error("Failed to replay [{$event->getSummaryForDisplay()}]: {$e->getMessage()}");
             $this->recordAttempt($event, $scheduledAt, null, $e->getMessage());
@@ -410,6 +421,8 @@ class ScheduleCatchupCommand extends Command
         if ($event->skippedBecauseOverlapping) {
             $this->warn("Replay of [{$event->getSummaryForDisplay()}] at {$scheduledAt->toDateTimeString()} was skipped because the command is already running; it will be retried.");
             $this->recordDeferred($event, $scheduledAt);
+
+            event(new ScheduleOccurrenceDeferred($event, $scheduledAt));
 
             return 'deferred';
         }
@@ -435,6 +448,8 @@ class ScheduleCatchupCommand extends Command
         );
 
         $this->info("Replayed [{$event->getSummaryForDisplay()}] scheduled at {$scheduledAt->toDateTimeString()} (exit {$exitCode}).");
+
+        event(new ScheduleOccurrenceReplayed($event, $scheduledAt, (int) $exitCode, $runtime));
 
         return 'replayed';
     }
@@ -464,8 +479,11 @@ class ScheduleCatchupCommand extends Command
         ])->save();
 
         $label = "{$event->getSummaryForDisplay()} @ {$scheduledAt->toDateTimeString()}";
+        $isExhausted = $log->attempts >= $this->maxAttempts;
 
-        if ($log->attempts >= $this->maxAttempts) {
+        event(new ScheduleOccurrenceFailed($event, $scheduledAt, $exitCode, $error, $log->attempts, $isExhausted));
+
+        if ($isExhausted) {
             $this->exhausted[] = $label;
             $this->error("Giving up on [{$label}] after {$log->attempts} attempt(s).");
 

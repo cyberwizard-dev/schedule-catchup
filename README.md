@@ -147,6 +147,28 @@ Order of operations is: replays finish, then `ScheduleCatchupCompleted`, then `o
 
 `ScheduleCatchupFailed` only fires for new failures and final give-ups. Intermediate retries stay quiet, so one broken command doesn't turn into an alert every five minutes.
 
+### Per-occurrence events
+
+Replays call `Event::run()` directly, so Laravel's `ScheduledTask*` events don't fire for them. For per-occurrence detail (for example to feed a monitoring tool), listen for these instead. `$event` is the `Illuminate\Console\Scheduling\Event` and `$scheduledAt` is the `Carbon` slot being replayed.
+
+| Event | Properties | Fired when |
+| --- | --- | --- |
+| `ScheduleOccurrenceReplayed` | `event`, `scheduledAt`, `exitCode`, `runtime` (seconds, float) | An occurrence was replayed successfully. |
+| `ScheduleOccurrenceFailed` | `event`, `scheduledAt`, `exitCode` (`null` if it threw), `error`, `attempts`, `exhausted` | Every failed attempt, including retries. `exhausted` is true once `max_attempts` is reached. |
+| `ScheduleOccurrenceDeferred` | `event`, `scheduledAt` | The replay was skipped because the command was already running; it stays owed. |
+| `ScheduleOutageRecorded` | `outage` (`SchedulerOutage`) | A new outage row was created. |
+
+All live in `Cyberwizard\ScheduleCatchup\Events`. `ScheduleReplayRegistry::isTagged($event)` tells a listener whether an event was tagged with `replayOnCatchup()`.
+
+```php
+use Cyberwizard\ScheduleCatchup\Events\ScheduleOccurrenceFailed;
+
+Event::listen(ScheduleOccurrenceFailed::class, function (ScheduleOccurrenceFailed $failed): void {
+    // $failed->event->getSummaryForDisplay(), $failed->scheduledAt, $failed->error,
+    // $failed->attempts, $failed->exhausted
+});
+```
+
 ## Commands
 
 ```bash
