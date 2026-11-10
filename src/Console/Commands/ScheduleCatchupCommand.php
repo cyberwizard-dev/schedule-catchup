@@ -49,6 +49,29 @@ class ScheduleCatchupCommand extends Command
     /** @var array<int, array<string, string>> */
     protected array $replayedDetails = [];
 
+    /**
+     * Checkpoint values loaded once per run (last tick and every tagged event's cursor),
+     * kept in step with every write the run makes.
+     *
+     * @var array<string, string>
+     */
+    protected array $checkpoints = [];
+
+    /**
+     * Ledger rows for every tagged event, loaded in three queries before the walk.
+     *
+     * @var array{latest: array<string, string>, settled: array<string, array<int, Carbon>>, pending: array<string, array<int, Carbon>>}|null
+     */
+    protected ?array $ledger = null;
+
+    /**
+     * Ledger keys already walked this run. A second event sharing a key would see the first
+     * one's writes, so it reads the ledger fresh rather than from the preloaded snapshot.
+     *
+     * @var array<string, true>
+     */
+    protected array $walkedKeys = [];
+
     public function handle()
     {
         $this->maxAttempts = max(1, (int) config('schedule-catchup.max_attempts', 3));
@@ -76,6 +99,11 @@ class ScheduleCatchupCommand extends Command
         $this->newFailures = [];
         $this->exhausted = [];
         $this->replayedDetails = [];
+        $this->ledger = null;
+        $this->walkedKeys = [];
+
+        $events = $this->replayableEvents();
+        $this->loadCheckpoints($events);
 
         $lastTick = $this->lastTick();
 
@@ -87,7 +115,6 @@ class ScheduleCatchupCommand extends Command
             return Command::SUCCESS;
         }
 
-        $events = $this->replayableEvents();
         $gapMinutes = (int) $lastTick->diffInMinutes(now());
 
         if (! $this->option('dry-run') && $gapMinutes >= max(1, (int) config('schedule-catchup.outage_after_minutes', 10))) {
@@ -115,10 +142,13 @@ class ScheduleCatchupCommand extends Command
         $skipped = 0;
         $deferred = 0;
 
+        $this->loadLedger($events, $lastTick);
+
         foreach ($events as $event) {
             $resumeFrom = $this->resumePoint($event, $lastTick);
             $this->eventCapHit = false;
             $occurrences = $this->occurrencesToReplay($event, $resumeFrom);
+            $this->walkedKeys[ScheduleEventKey::for($event)] = true;
 
             foreach ($occurrences as $scheduledAt) {
                 if ($this->option('dry-run')) {
@@ -228,17 +258,119 @@ class ScheduleCatchupCommand extends Command
         return true;
     }
 
+    /**
+     * Reads the last tick and every tagged event's cursor in one query.
+     *
+     * @param  array<int, Event>  $events
+     */
+    protected function loadCheckpoints(array $events): void
+    {
+        $keys = collect($events)
+            ->map(fn (Event $event) => $this->cursorKey($event))
+            ->prepend(SchedulerCatchupCheckpoint::LAST_TICK)
+            ->unique()
+            ->values()
+            ->all();
+
+        $this->checkpoints = SchedulerCatchupCheckpoint::query()
+            ->whereIn('key', $keys)
+            ->pluck('value', 'key')
+            ->all();
+    }
+
+    protected function checkpoint(string $key): ?string
+    {
+        return $this->checkpoints[$key] ?? null;
+    }
+
+    protected function setCheckpoint(string $key, string $value): void
+    {
+        SchedulerCatchupCheckpoint::set($key, $value);
+
+        $this->checkpoints[$key] = $value;
+    }
+
+    protected function forgetCheckpoint(string $key): void
+    {
+        SchedulerCatchupCheckpoint::query()->where('key', $key)->delete();
+
+        unset($this->checkpoints[$key]);
+    }
+
+    /**
+     * Loads, for all tagged events at once, the latest logged slot per command, the settled
+     * slots inside the earliest window any event will walk, and every pending slot. Each
+     * event then takes its own share in PHP, applying its own lower bound.
+     *
+     * @param  array<int, Event>  $events
+     */
+    protected function loadLedger(array $events, Carbon $lastTick): void
+    {
+        $this->ledger = ['latest' => [], 'settled' => [], 'pending' => []];
+
+        $commands = collect($events)
+            ->map(fn (Event $event) => ScheduleEventKey::for($event))
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($commands === []) {
+            return;
+        }
+
+        $this->ledger['latest'] = SchedulerCatchupLog::query()
+            ->toBase()
+            ->selectRaw('command, max(scheduled_at) as latest')
+            ->whereIn('command', $commands)
+            ->groupBy('command')
+            ->pluck('latest', 'command')
+            ->filter()
+            ->all();
+
+        $earliest = collect($events)
+            ->map(fn (Event $event) => $this->resumePoint($event, $lastTick))
+            ->min(fn (Carbon $from) => $from->toDateTimeString());
+
+        SchedulerCatchupLog::query()
+            ->whereIn('command', $commands)
+            ->where('scheduled_at', '>=', $earliest)
+            ->where(fn ($query) => $query->where('exit_code', 0)->orWhere('attempts', '>=', $this->maxAttempts))
+            ->get(['command', 'scheduled_at'])
+            ->each(function (SchedulerCatchupLog $log): void {
+                $this->ledger['settled'][$log->command][] = Carbon::parse($log->scheduled_at);
+            });
+
+        SchedulerCatchupLog::query()
+            ->whereIn('command', $commands)
+            ->where('attempts', '<', $this->maxAttempts)
+            ->where(fn ($query) => $query->where('exit_code', '!=', 0)->orWhereNull('exit_code'))
+            ->get(['command', 'scheduled_at'])
+            ->each(function (SchedulerCatchupLog $log): void {
+                $this->ledger['pending'][$log->command][] = Carbon::parse($log->scheduled_at);
+            });
+    }
+
+    /**
+     * Whether the preloaded ledger still matches the database for this event. It stops
+     * matching once another event with the same key has been walked and written rows.
+     */
+    protected function usesPreloadedLedger(Event $event): bool
+    {
+        return $this->ledger !== null && ! isset($this->walkedKeys[ScheduleEventKey::for($event)]);
+    }
+
     protected function resumePoint(Event $event, Carbon $lastTick): Carbon
     {
         // A walk cut short by the cap resumes where it stopped, even though the
         // heartbeat has since moved the last tick past it.
-        $cursor = SchedulerCatchupCheckpoint::get($this->cursorKey($event));
+        $cursor = $this->checkpoint($this->cursorKey($event));
         if ($cursor) {
             return Carbon::parse($cursor);
         }
 
-        $lastLogged = SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))
-            ->max('scheduled_at');
+        $lastLogged = $this->usesPreloadedLedger($event)
+            ? ($this->ledger['latest'][ScheduleEventKey::for($event)] ?? null)
+            : SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))->max('scheduled_at');
 
         if ($lastLogged) {
             $lastLogged = Carbon::parse($lastLogged);
@@ -277,6 +409,16 @@ class ScheduleCatchupCommand extends Command
      */
     protected function settledSlots(Event $event, Carbon $from): array
     {
+        if ($this->usesPreloadedLedger($event)) {
+            $lowerBound = $from->toDateTimeString();
+
+            return collect($this->ledger['settled'][ScheduleEventKey::for($event)] ?? [])
+                ->map(fn (Carbon $slot) => $slot->toDateTimeString())
+                ->filter(fn (string $slot) => $slot >= $lowerBound)
+                ->values()
+                ->all();
+        }
+
         return SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))
             ->where('scheduled_at', '>=', $from->toDateTimeString())
             ->where(fn ($query) => $query->where('exit_code', 0)->orWhere('attempts', '>=', $this->maxAttempts))
@@ -290,6 +432,13 @@ class ScheduleCatchupCommand extends Command
      */
     protected function pendingSlots(Event $event): array
     {
+        if ($this->usesPreloadedLedger($event)) {
+            return array_map(
+                fn (Carbon $slot) => $slot->copy(),
+                $this->ledger['pending'][ScheduleEventKey::for($event)] ?? []
+            );
+        }
+
         return SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))
             ->where('attempts', '<', $this->maxAttempts)
             ->where(fn ($query) => $query->where('exit_code', '!=', 0)->orWhereNull('exit_code'))
@@ -376,13 +525,13 @@ class ScheduleCatchupCommand extends Command
         $key = $this->cursorKey($event);
 
         if ($this->eventCapHit && $occurrences !== []) {
-            SchedulerCatchupCheckpoint::set($key, end($occurrences)->toDateTimeString());
+            $this->setCheckpoint($key, end($occurrences)->toDateTimeString());
 
             return;
         }
 
-        if (SchedulerCatchupCheckpoint::get($key) !== null) {
-            SchedulerCatchupCheckpoint::query()->where('key', $key)->delete();
+        if ($this->checkpoint($key) !== null) {
+            $this->forgetCheckpoint($key);
         }
     }
 
@@ -536,14 +685,14 @@ class ScheduleCatchupCommand extends Command
 
     protected function lastTick(): ?Carbon
     {
-        $value = SchedulerCatchupCheckpoint::get(SchedulerCatchupCheckpoint::LAST_TICK);
+        $value = $this->checkpoint(SchedulerCatchupCheckpoint::LAST_TICK);
 
         return $value ? Carbon::parse($value) : null;
     }
 
     protected function recordTick(): void
     {
-        SchedulerCatchupCheckpoint::set(SchedulerCatchupCheckpoint::LAST_TICK, now()->toDateTimeString());
+        $this->setCheckpoint(SchedulerCatchupCheckpoint::LAST_TICK, now()->toDateTimeString());
     }
 
     protected function notifyReplay(int $count, int $skipped, int $deferred): void

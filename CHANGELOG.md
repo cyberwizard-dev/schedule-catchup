@@ -2,6 +2,12 @@
 
 Notable changes to `cyberwizard/schedule-catchup` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - Unreleased
+
+### Changed
+
+- Fewer queries per run. `schedule-catchup:run` used to read the checkpoints and the ledger separately for every tagged event (five selects each: two checkpoint lookups, the latest slot, settled slots and pending slots). It now loads the last tick and every cursor in one query and the ledger for all tagged events in three (latest slot per command, settled slots, pending slots), so the number of reads no longer grows with the number of tagged events. With 20 tagged events and nothing to replay a run went from 103 selects to 6. Per-occurrence writes are unchanged, and replay decisions are the same as before.
+
 ## [1.2.1] - 2026-11-10
 
 ### Fixed
