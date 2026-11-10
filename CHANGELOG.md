@@ -2,6 +2,16 @@
 
 Notable changes to `cyberwizard/schedule-catchup` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - Unreleased
+
+### Fixed
+
+- Two tagged events with the same command or name but a different schedule (for example the same command at 00:00 and at 06:00) shared one ledger key. The second event resumed its walk from the slot the first had just logged, so its own missed slots before that point were skipped and never replayed. The ledger key is now `<command>|<cron expression>|<timezone>` (plus `|<n>s` for sub-minute events), so each event keeps its own rows and cursor. Normal runs recorded by the listener use the new key too.
+
+### Changed
+
+- Ledger rows and `cursor:` checkpoints written under the old command-only key are still honoured after upgrading. When only one event has that old key they count as its own and move to the new key as it is replayed, pending rows keeping their attempt count. When several events share it, old rows still settle matching slots for each of them, an old pending row is owed by the first event whose cron is due at it, and the shared old cursor can only pull a walk back. The run reads both keys in the same three ledger queries, so the number of selects is unchanged. See "Event keys" in the README.
+
 ## [1.2.2] - 2026-11-10
 
 ### Changed

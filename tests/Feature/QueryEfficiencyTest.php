@@ -5,6 +5,7 @@ namespace Cyberwizard\ScheduleCatchup\Tests\Feature;
 use Carbon\Carbon;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupCheckpoint;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupLog;
+use Cyberwizard\ScheduleCatchup\Support\ScheduleEventKey;
 use Cyberwizard\ScheduleCatchup\Tests\TestCase;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -50,6 +51,20 @@ class QueryEfficiencyTest extends TestCase
         $this->assertSame(6, $this->selectsForRun(now()->subDays(2)));
     }
 
+    public function test_reading_rows_under_current_and_pre_1_2_3_keys_costs_no_extra_selects(): void
+    {
+        // settledEvents() logs under the pre-1.2.3 key; these use the current one.
+        $this->settledEvents('test:legacy-', 10);
+
+        for ($i = 0; $i < 10; $i++) {
+            $event = Schedule::call(fn () => null)->name('test:current-'.$i)->dailyAt('00:00')->replayOnCatchup();
+            $this->log(ScheduleEventKey::for($event), '2026-08-16 00:00:00', 0, 1);
+            $this->log(ScheduleEventKey::for($event), '2026-08-17 00:00:00', 0, 1);
+        }
+
+        $this->assertSame(6, $this->selectsForRun(now()->subDays(2)));
+    }
+
     public function test_the_below_threshold_exit_does_not_query_per_event(): void
     {
         $this->settledEvents('test:few-', 5);
@@ -61,6 +76,11 @@ class QueryEfficiencyTest extends TestCase
         $this->assertSame($few, $many);
     }
 
+    /**
+     * Rows and cursors here are written under the pre-1.2.3 key (the event name alone), as an
+     * upgraded install would have them; each is the only event with that key, so they are
+     * honoured and migrated.
+     */
     public function test_replay_decisions_are_unchanged_for_a_mixed_scenario(): void
     {
         config(['schedule-catchup.max_occurrences' => 5]);
@@ -108,10 +128,12 @@ class QueryEfficiencyTest extends TestCase
         Schedule::call(fn () => $record('ahead'))->name('test:ahead')->hourlyAt(0)->replayOnCatchup();
         $this->log('test:ahead', '2026-08-17 09:00:00', 0, 1);
 
-        // Two events sharing one ledger key: the second resumes from the slot the first
-        // just logged, so its 2026-08-16 06:00 slot is stepped over (long-standing behaviour).
-        Schedule::call(fn () => $record('shared-a'))->name('test:shared')->dailyAt('00:00')->replayOnCatchup();
-        Schedule::call(fn () => $record('shared-b'))->name('test:shared')->dailyAt('06:00')->replayOnCatchup();
+        // Two events with one name on different crons. Up to 1.2.2 they shared a ledger key,
+        // so the second resumed from the slot the first had just logged (2026-08-17 00:00)
+        // and its own 2026-08-16 06:00 slot was stepped over and never replayed. The key now
+        // includes the cron expression, so each walks its own ledger and both slots run.
+        $sharedA = Schedule::call(fn () => $record('shared-a'))->name('test:shared')->dailyAt('00:00')->replayOnCatchup();
+        $sharedB = Schedule::call(fn () => $record('shared-b'))->name('test:shared')->dailyAt('06:00')->replayOnCatchup();
 
         $this->artisan('schedule-catchup:run')->assertExitCode(0);
 
@@ -135,16 +157,24 @@ class QueryEfficiencyTest extends TestCase
             'ahead@2026-08-17 11:00:00',
             'shared-a@2026-08-16 00:00:00',
             'shared-a@2026-08-17 00:00:00',
+            'shared-b@2026-08-16 06:00:00',
             'shared-b@2026-08-17 06:00:00',
         ], $ran);
 
-        $this->assertSame('2026-08-17 11:35:00', SchedulerCatchupCheckpoint::get('cursor:test:capped'));
+        $this->assertNotSame(ScheduleEventKey::for($sharedA), ScheduleEventKey::for($sharedB));
+
+        // The pre-1.2.3 cursor was honoured, then moved to the current key.
+        $this->assertSame('2026-08-17 11:35:00', SchedulerCatchupCheckpoint::get('cursor:test:capped|* * * * *|UTC'));
+        $this->assertNull(SchedulerCatchupCheckpoint::get('cursor:test:capped'));
         $this->assertNull(SchedulerCatchupCheckpoint::get('cursor:test:stale'));
+        $this->assertNull(SchedulerCatchupCheckpoint::get('cursor:test:stale|58 11 * * *|UTC'));
         $this->assertSame('2026-08-15 12:00:00', SchedulerCatchupCheckpoint::get('last_tick'), 'Failures hold the checkpoint back.');
 
-        $failing = SchedulerCatchupLog::where('command', 'test:failing')->orderBy('scheduled_at')->get();
+        // The pending pre-1.2.3 row moved to the current key and kept its attempt count.
+        $this->assertSame(0, SchedulerCatchupLog::where('command', 'test:failing')->count());
+        $failing = SchedulerCatchupLog::where('command', 'test:failing|0 0 * * *|UTC')->orderBy('scheduled_at')->get();
         $this->assertSame([3, 1], $failing->pluck('attempts')->all());
-        $this->assertSame(0, SchedulerCatchupLog::where('command', 'test:retried')->where('exit_code', '!=', 0)->count());
+        $this->assertSame(0, SchedulerCatchupLog::whereIn('command', ['test:retried', 'test:retried|0 0 * * *|UTC'])->where('exit_code', '!=', 0)->count());
     }
 
     private function settledEvents(string $prefix, int $count): void

@@ -240,11 +240,22 @@ class MyCommand extends Command
 The package creates four tables, prefixed with `cyber_` unless you change `table_prefix`:
 
 - `cyber_schedule_catchup_checkpoints` holds the `last_tick` timestamp.
-- `cyber_schedule_catchup_logs` is the run ledger: one row per `(command, scheduled_at)`, with the source (`catchup` or `scheduled`), exit code, attempt count, and last error.
+- `cyber_schedule_catchup_logs` is the run ledger: one row per `(command, scheduled_at)`, with the source (`catchup` or `scheduled`), exit code, attempt count, and last error. The `command` column holds the event key from `ScheduleEventKey::for()` (see below).
 - `cyber_schedule_command_runs` backs the `RecordsScheduleRun` trait, unique on `(command, period_key)`.
 - `cyber_schedule_catchup_outages` lists outages: `started_at`, `ended_at` and `minutes`.
 
-The checkpoints table also holds a `cursor:<event>` row while a capped event is still catching up.
+The checkpoints table also holds a `cursor:<event key>` row while a capped event is still catching up.
+
+### Event keys
+
+Since 1.2.3 an event's key is `<command>|<cron expression>|<timezone>`, for example `reports:send --team=1|0 6 * * *|UTC`, with `|<n>s` appended for sub-minute events. Keys longer than 255 characters are cut short and end in `#<sha1>`. The same command scheduled on two frequencies therefore keeps two ledgers, and one schedule's runs can no longer hide the other's missed slots. Changing an event's cron expression or timezone gives it a new key: its next walk starts from the last tick, and rows logged under the previous key no longer settle or owe its slots.
+
+Releases up to 1.2.2 keyed on the command alone. After upgrading, rows and cursors written under the old key are still read:
+
+- If only one tagged event has that old key, its old rows settle and owe slots as before, its old cursor is honoured, and both move to the new key as the event is replayed (a pending row keeps its attempt count).
+- If several events share it, the old rows cannot be told apart. An old settled row settles the matching slot of every sharer, so nothing that ran is run again; an old pending row is owed by the first sharer whose cron is due at that slot; the shared old cursor can only move a walk back, never forward, and is removed once every sharer has been walked.
+
+Old settled rows are left in place and age out through `schedule-catchup:prune`. If you query the ledger yourself, match on the new key, or on the old one for rows written before the upgrade.
 
 ## Testing
 

@@ -7,6 +7,7 @@ use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupCheckpoint;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupLog;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCommandRun;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerOutage;
+use Cyberwizard\ScheduleCatchup\Support\ScheduleEventKey;
 use Cyberwizard\ScheduleCatchup\Tests\TestCase;
 use Cyberwizard\ScheduleCatchup\Traits\RecordsScheduleRun;
 use Cyberwizard\ScheduleCatchup\Traits\ResolvesScheduledTime;
@@ -52,7 +53,7 @@ class HardeningTest extends TestCase
     public function test_a_capped_backlog_drains_even_though_the_heartbeat_moves_the_last_tick(): void
     {
         $ran = [];
-        Schedule::call(function () use (&$ran): void {
+        $event = Schedule::call(function () use (&$ran): void {
             $ran[] = env('SCHEDULED_EVENT_TIME');
         })->name('test:cap')->everyMinute()->replayOnCatchup();
 
@@ -69,7 +70,7 @@ class HardeningTest extends TestCase
         $this->assertSame(count($ran), count(array_unique($ran)));
         $this->assertContains('2026-08-17 10:01:00', $ran);
         $this->assertContains('2026-08-17 11:59:00', $ran);
-        $this->assertNull(SchedulerCatchupCheckpoint::get('cursor:test:cap'), 'The cursor is cleared once caught up.');
+        $this->assertNull(SchedulerCatchupCheckpoint::get('cursor:'.ScheduleEventKey::for($event)), 'The cursor is cleared once caught up.');
     }
 
     public function test_a_replay_deferred_by_an_overlap_survives_the_heartbeat(): void
@@ -88,7 +89,7 @@ class HardeningTest extends TestCase
         $this->tick();
 
         $this->assertSame(1, $ran);
-        $this->assertSame(0, SchedulerCatchupLog::where('command', 'test:overlap')->sole()->exit_code);
+        $this->assertSame(0, SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))->sole()->exit_code);
     }
 
     public function test_an_outage_is_recorded_once_and_a_normal_gap_is_not(): void
@@ -155,7 +156,7 @@ class HardeningTest extends TestCase
         $task->exitCode = 0;
         EventFacade::dispatch(new ScheduledTaskFinished($task, 390));
 
-        $this->assertSame(['2026-08-17 11:55:00'], SchedulerCatchupLog::where('command', 'test:slow')->pluck('scheduled_at')->map->toDateTimeString()->all());
+        $this->assertSame(['2026-08-17 11:55:00'], SchedulerCatchupLog::where('command', ScheduleEventKey::for($task))->pluck('scheduled_at')->map->toDateTimeString()->all());
     }
 
     public function test_run_once_does_not_run_while_another_run_holds_the_period(): void

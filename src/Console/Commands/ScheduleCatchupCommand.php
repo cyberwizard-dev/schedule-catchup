@@ -15,6 +15,8 @@ use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupLog;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerOutage;
 use Cyberwizard\ScheduleCatchup\Support\ScheduleEventKey;
 use Cyberwizard\ScheduleCatchup\Support\ScheduleReplayRegistry;
+use DateTime;
+use DateTimeZone;
 use Illuminate\Console\Command;
 use Illuminate\Console\Scheduling\Event;
 use Illuminate\Console\Scheduling\Schedule as ScheduleManager;
@@ -58,19 +60,37 @@ class ScheduleCatchupCommand extends Command
     protected array $checkpoints = [];
 
     /**
-     * Ledger rows for every tagged event, loaded in three queries before the walk.
+     * Ledger rows for every tagged event, loaded in three queries before the walk and keyed
+     * by ScheduleEventKey::for(). Rows written under a pre-1.2.3 key are folded in, and
+     * `legacyPending` remembers which pending slots still live under that old key.
      *
-     * @var array{latest: array<string, string>, settled: array<string, array<int, Carbon>>, pending: array<string, array<int, Carbon>>}|null
+     * @var array{latest: array<string, string>, settled: array<string, array<int, Carbon>>, pending: array<string, array<int, Carbon>>, legacyPending: array<string, array<string, string>>}|null
      */
     protected ?array $ledger = null;
 
     /**
      * Ledger keys already walked this run. A second event sharing a key would see the first
-     * one's writes, so it reads the ledger fresh rather than from the preloaded snapshot.
+     * one's writes, so its share of the ledger is reloaded before it is walked.
      *
      * @var array<string, true>
      */
     protected array $walkedKeys = [];
+
+    /**
+     * Every pre-1.2.3 key among the tagged events, mapped to the distinct current keys that
+     * share it, in schedule order. One owner means old rows and cursors can be attributed to
+     * that event; several mean the old ledger mixed their runs together.
+     *
+     * @var array<string, array<int, string>>
+     */
+    protected array $legacyOwners = [];
+
+    /**
+     * The first tagged event for each current key.
+     *
+     * @var array<string, Event>
+     */
+    protected array $eventsByKey = [];
 
     public function handle()
     {
@@ -102,6 +122,7 @@ class ScheduleCatchupCommand extends Command
         $this->ledger = null;
         $this->walkedKeys = [];
 
+        $this->mapLegacyKeys();
         $events = $this->replayableEvents();
         $this->loadCheckpoints($events);
 
@@ -145,6 +166,10 @@ class ScheduleCatchupCommand extends Command
         $this->loadLedger($events, $lastTick);
 
         foreach ($events as $event) {
+            if (isset($this->walkedKeys[ScheduleEventKey::for($event)])) {
+                $this->loadLedger([$event], $lastTick);
+            }
+
             $resumeFrom = $this->resumePoint($event, $lastTick);
             $this->eventCapHit = false;
             $occurrences = $this->occurrencesToReplay($event, $resumeFrom);
@@ -199,6 +224,10 @@ class ScheduleCatchupCommand extends Command
             }
         }
 
+        if (! $this->option('dry-run')) {
+            $this->retireLegacyCursors($events);
+        }
+
         if ($replayed > 0) {
             $this->notifyReplay($replayed, $skipped, $deferred);
         }
@@ -245,6 +274,39 @@ class ScheduleCatchupCommand extends Command
     }
 
     /**
+     * Maps every pre-1.2.3 key to the current keys that share it. Built from all tagged
+     * events, not just those selected by --only, so ambiguity does not depend on the filter.
+     */
+    protected function mapLegacyKeys(): void
+    {
+        $this->legacyOwners = [];
+        $this->eventsByKey = [];
+
+        foreach (Schedule::events() as $event) {
+            if (! ScheduleReplayRegistry::isTagged($event)) {
+                continue;
+            }
+
+            $key = ScheduleEventKey::for($event);
+            $legacy = ScheduleEventKey::legacy($event);
+
+            $this->eventsByKey[$key] ??= $event;
+
+            if (! in_array($key, $this->legacyOwners[$legacy] ?? [], true)) {
+                $this->legacyOwners[$legacy][] = $key;
+            }
+        }
+    }
+
+    /**
+     * Whether rows and cursors written under this event's pre-1.2.3 key belong to it alone.
+     */
+    protected function legacyKeyIsUnambiguous(Event $event): bool
+    {
+        return count($this->legacyOwners[ScheduleEventKey::legacy($event)] ?? []) <= 1;
+    }
+
+    /**
      * @param  array<int, Event>  $events
      */
     protected function nothingDueSince(array $events, Carbon $lastTick): bool
@@ -266,7 +328,7 @@ class ScheduleCatchupCommand extends Command
     protected function loadCheckpoints(array $events): void
     {
         $keys = collect($events)
-            ->map(fn (Event $event) => $this->cursorKey($event))
+            ->flatMap(fn (Event $event) => [$this->cursorKey($event), $this->legacyCursorKey($event)])
             ->prepend(SchedulerCatchupCheckpoint::LAST_TICK)
             ->unique()
             ->values()
@@ -298,27 +360,53 @@ class ScheduleCatchupCommand extends Command
     }
 
     /**
-     * Loads, for all tagged events at once, the latest logged slot per command, the settled
-     * slots inside the earliest window any event will walk, and every pending slot. Each
-     * event then takes its own share in PHP, applying its own lower bound.
+     * Loads, for the given events at once, the latest logged slot per key, the settled slots
+     * inside the earliest window any of them will walk, and every pending slot. Each event
+     * then takes its own share in PHP, applying its own lower bound. Entries for these
+     * events' keys are replaced, so this also refreshes one key after it has been walked.
+     *
+     * Rows written under a pre-1.2.3 key are read in the same queries. When only one event
+     * maps to that key they are its rows: they settle its slots, owe its pending slots and
+     * count towards its latest slot. When several events share it, the rows cannot be told
+     * apart: they still settle any matching slot of every sharer (so nothing that ran is run
+     * again), each pending slot is owed by the first sharer whose cron is due at it, and the
+     * shared latest slot is ignored, because resuming from it is what skipped the other
+     * events' missed slots.
      *
      * @param  array<int, Event>  $events
      */
     protected function loadLedger(array $events, Carbon $lastTick): void
     {
-        $this->ledger = ['latest' => [], 'settled' => [], 'pending' => []];
+        $this->ledger ??= ['latest' => [], 'settled' => [], 'pending' => [], 'legacyPending' => []];
 
-        $commands = collect($events)
+        $keys = collect($events)
             ->map(fn (Event $event) => ScheduleEventKey::for($event))
             ->unique()
             ->values()
             ->all();
 
-        if ($commands === []) {
+        if ($keys === []) {
             return;
         }
 
-        $this->ledger['latest'] = SchedulerCatchupLog::query()
+        foreach ($keys as $key) {
+            unset(
+                $this->ledger['latest'][$key],
+                $this->ledger['settled'][$key],
+                $this->ledger['pending'][$key],
+                $this->ledger['legacyPending'][$key],
+            );
+        }
+
+        $legacyKeys = collect($events)
+            ->map(fn (Event $event) => ScheduleEventKey::legacy($event))
+            ->unique()
+            ->values()
+            ->all();
+
+        $commands = array_values(array_unique([...$keys, ...$legacyKeys]));
+
+        $latest = SchedulerCatchupLog::query()
             ->toBase()
             ->selectRaw('command, max(scheduled_at) as latest')
             ->whereIn('command', $commands)
@@ -326,6 +414,24 @@ class ScheduleCatchupCommand extends Command
             ->pluck('latest', 'command')
             ->filter()
             ->all();
+
+        foreach ($events as $event) {
+            $key = ScheduleEventKey::for($event);
+            $candidates = [$latest[$key] ?? null];
+
+            if ($this->legacyKeyIsUnambiguous($event)) {
+                $candidates[] = $latest[ScheduleEventKey::legacy($event)] ?? null;
+            }
+
+            $newest = collect($candidates)
+                ->filter()
+                ->map(fn ($slot) => Carbon::parse($slot)->toDateTimeString())
+                ->max();
+
+            if ($newest !== null) {
+                $this->ledger['latest'][$key] = $newest;
+            }
+        }
 
         $earliest = collect($events)
             ->map(fn (Event $event) => $this->resumePoint($event, $lastTick))
@@ -336,8 +442,14 @@ class ScheduleCatchupCommand extends Command
             ->where('scheduled_at', '>=', $earliest)
             ->where(fn ($query) => $query->where('exit_code', 0)->orWhere('attempts', '>=', $this->maxAttempts))
             ->get(['command', 'scheduled_at'])
-            ->each(function (SchedulerCatchupLog $log): void {
-                $this->ledger['settled'][$log->command][] = Carbon::parse($log->scheduled_at);
+            ->each(function (SchedulerCatchupLog $log) use ($keys): void {
+                $owners = in_array($log->command, $keys, true)
+                    ? [$log->command]
+                    : array_intersect($this->legacyOwners[$log->command] ?? [], $keys);
+
+                foreach ($owners as $owner) {
+                    $this->ledger['settled'][$owner][] = Carbon::parse($log->scheduled_at);
+                }
             });
 
         SchedulerCatchupLog::query()
@@ -345,18 +457,52 @@ class ScheduleCatchupCommand extends Command
             ->where('attempts', '<', $this->maxAttempts)
             ->where(fn ($query) => $query->where('exit_code', '!=', 0)->orWhereNull('exit_code'))
             ->get(['command', 'scheduled_at'])
-            ->each(function (SchedulerCatchupLog $log): void {
-                $this->ledger['pending'][$log->command][] = Carbon::parse($log->scheduled_at);
+            ->each(function (SchedulerCatchupLog $log) use ($keys): void {
+                $slot = Carbon::parse($log->scheduled_at);
+
+                if (in_array($log->command, $keys, true)) {
+                    $this->ledger['pending'][$log->command][] = $slot;
+
+                    return;
+                }
+
+                $owner = $this->legacyPendingOwner($log->command, $slot);
+
+                if ($owner !== null && in_array($owner, $keys, true)) {
+                    $this->ledger['pending'][$owner][] = $slot;
+                    $this->ledger['legacyPending'][$owner][$slot->toDateTimeString()] = $log->command;
+                }
             });
     }
 
     /**
-     * Whether the preloaded ledger still matches the database for this event. It stops
-     * matching once another event with the same key has been walked and written rows.
+     * The current key that owes a pending slot logged under a pre-1.2.3 key: its only owner,
+     * or, when shared, the first owner whose cron is due at that slot (else the first owner).
      */
-    protected function usesPreloadedLedger(Event $event): bool
+    protected function legacyPendingOwner(string $legacy, Carbon $slot): ?string
     {
-        return $this->ledger !== null && ! isset($this->walkedKeys[ScheduleEventKey::for($event)]);
+        $owners = $this->legacyOwners[$legacy] ?? [];
+
+        if (count($owners) <= 1) {
+            return $owners[0] ?? null;
+        }
+
+        foreach ($owners as $owner) {
+            $event = $this->eventsByKey[$owner];
+
+            try {
+                $timezone = $event->timezone ?: date_default_timezone_get();
+                $at = new DateTime($slot->toDateTimeString(), $timezone instanceof DateTimeZone ? $timezone : new DateTimeZone($timezone));
+
+                if ((new CronExpression($event->getExpression()))->isDue($at, $at->getTimezone()->getName())) {
+                    return $owner;
+                }
+            } catch (Throwable $e) {
+                continue;
+            }
+        }
+
+        return $owners[0];
     }
 
     protected function resumePoint(Event $event, Carbon $lastTick): Carbon
@@ -368,19 +514,31 @@ class ScheduleCatchupCommand extends Command
             return Carbon::parse($cursor);
         }
 
-        $lastLogged = $this->usesPreloadedLedger($event)
-            ? ($this->ledger['latest'][ScheduleEventKey::for($event)] ?? null)
-            : SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))->max('scheduled_at');
+        $resumeFrom = $lastTick;
+        $lastLogged = $this->ledger['latest'][ScheduleEventKey::for($event)] ?? null;
 
         if ($lastLogged) {
             $lastLogged = Carbon::parse($lastLogged);
 
             if ($lastLogged->gt($lastTick)) {
-                return $lastLogged;
+                $resumeFrom = $lastLogged;
             }
         }
 
-        return $lastTick;
+        // A cursor written before 1.2.3 is this event's own when nobody else shares its old
+        // key. A shared one may belong to another event, so it can only pull the walk back,
+        // never push it forward past slots this event still owes.
+        $legacyCursor = $this->checkpoint($this->legacyCursorKey($event));
+
+        if ($legacyCursor) {
+            $legacyCursor = Carbon::parse($legacyCursor);
+
+            if ($this->legacyKeyIsUnambiguous($event) || $legacyCursor->lt($resumeFrom)) {
+                return $legacyCursor;
+            }
+        }
+
+        return $resumeFrom;
     }
 
     /**
@@ -409,21 +567,12 @@ class ScheduleCatchupCommand extends Command
      */
     protected function settledSlots(Event $event, Carbon $from): array
     {
-        if ($this->usesPreloadedLedger($event)) {
-            $lowerBound = $from->toDateTimeString();
+        $lowerBound = $from->toDateTimeString();
 
-            return collect($this->ledger['settled'][ScheduleEventKey::for($event)] ?? [])
-                ->map(fn (Carbon $slot) => $slot->toDateTimeString())
-                ->filter(fn (string $slot) => $slot >= $lowerBound)
-                ->values()
-                ->all();
-        }
-
-        return SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))
-            ->where('scheduled_at', '>=', $from->toDateTimeString())
-            ->where(fn ($query) => $query->where('exit_code', 0)->orWhere('attempts', '>=', $this->maxAttempts))
-            ->pluck('scheduled_at')
-            ->map(fn ($slot) => Carbon::parse($slot)->toDateTimeString())
+        return collect($this->ledger['settled'][ScheduleEventKey::for($event)] ?? [])
+            ->map(fn (Carbon $slot) => $slot->toDateTimeString())
+            ->filter(fn (string $slot) => $slot >= $lowerBound)
+            ->values()
             ->all();
     }
 
@@ -432,19 +581,10 @@ class ScheduleCatchupCommand extends Command
      */
     protected function pendingSlots(Event $event): array
     {
-        if ($this->usesPreloadedLedger($event)) {
-            return array_map(
-                fn (Carbon $slot) => $slot->copy(),
-                $this->ledger['pending'][ScheduleEventKey::for($event)] ?? []
-            );
-        }
-
-        return SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))
-            ->where('attempts', '<', $this->maxAttempts)
-            ->where(fn ($query) => $query->where('exit_code', '!=', 0)->orWhereNull('exit_code'))
-            ->pluck('scheduled_at')
-            ->map(fn ($slot) => Carbon::parse($slot))
-            ->all();
+        return array_map(
+            fn (Carbon $slot) => $slot->copy(),
+            $this->ledger['pending'][ScheduleEventKey::for($event)] ?? []
+        );
     }
 
     /**
@@ -512,6 +652,41 @@ class ScheduleCatchupCommand extends Command
     protected function cursorKey(Event $event): string
     {
         return 'cursor:'.ScheduleEventKey::for($event);
+    }
+
+    /**
+     * Where releases before 1.2.3 kept this event's cursor.
+     */
+    protected function legacyCursorKey(Event $event): string
+    {
+        return 'cursor:'.ScheduleEventKey::legacy($event);
+    }
+
+    /**
+     * Drops a pre-1.2.3 cursor once every event sharing its old key has been walked this run.
+     * By then each has resumed from it and, if still capped, written a cursor of its own.
+     *
+     * @param  array<int, Event>  $events
+     */
+    protected function retireLegacyCursors(array $events): void
+    {
+        $legacyKeys = collect($events)
+            ->map(fn (Event $event) => ScheduleEventKey::legacy($event))
+            ->unique();
+
+        foreach ($legacyKeys as $legacy) {
+            $cursorKey = 'cursor:'.$legacy;
+
+            if ($this->checkpoint($cursorKey) === null) {
+                continue;
+            }
+
+            $owners = $this->legacyOwners[$legacy] ?? [];
+
+            if (collect($owners)->every(fn (string $owner) => isset($this->walkedKeys[$owner]))) {
+                $this->forgetCheckpoint($cursorKey);
+            }
+        }
     }
 
     /**
@@ -590,18 +765,12 @@ class ScheduleCatchupCommand extends Command
             return 'failed';
         }
 
-        SchedulerCatchupLog::updateOrCreate(
-            [
-                'command' => ScheduleEventKey::for($event),
-                'scheduled_at' => $scheduledAt->toDateTimeString(),
-            ],
-            [
-                'source' => 'catchup',
-                'ran_at' => now()->toDateTimeString(),
-                'exit_code' => 0,
-                'last_error' => null,
-            ]
-        );
+        $this->ledgerRow($event, $scheduledAt)->fill([
+            'source' => 'catchup',
+            'ran_at' => now()->toDateTimeString(),
+            'exit_code' => 0,
+            'last_error' => null,
+        ])->save();
 
         $this->info("Replayed [{$event->getSummaryForDisplay()}] scheduled at {$scheduledAt->toDateTimeString()} (exit {$exitCode}).");
 
@@ -617,12 +786,7 @@ class ScheduleCatchupCommand extends Command
      */
     protected function recordAttempt(Event $event, Carbon $scheduledAt, ?int $exitCode, string $error): void
     {
-        $key = ScheduleEventKey::for($event);
-
-        $log = SchedulerCatchupLog::firstOrNew([
-            'command' => $key,
-            'scheduled_at' => $scheduledAt->toDateTimeString(),
-        ]);
+        $log = $this->ledgerRow($event, $scheduledAt);
 
         $wasFirstAttempt = ! $log->exists;
 
@@ -653,12 +817,14 @@ class ScheduleCatchupCommand extends Command
 
     protected function recordDeferred(Event $event, Carbon $scheduledAt): void
     {
-        $log = SchedulerCatchupLog::firstOrNew([
-            'command' => ScheduleEventKey::for($event),
-            'scheduled_at' => $scheduledAt->toDateTimeString(),
-        ]);
+        $log = $this->ledgerRow($event, $scheduledAt);
 
         if ($log->exists) {
+            // A pending row carried over from a pre-1.2.3 key still needs its new key saved.
+            if ($log->isDirty()) {
+                $log->save();
+            }
+
             return;
         }
 
@@ -669,6 +835,40 @@ class ScheduleCatchupCommand extends Command
             'attempts' => 0,
             'last_error' => 'Deferred: the command was already running.',
         ])->save();
+    }
+
+    /**
+     * The ledger row for this event's slot, ready to fill and save. A slot still pending under
+     * the event's pre-1.2.3 key is moved to the current key, keeping its attempt count, so the
+     * retry budget carries over and the old row is not left owing the slot.
+     */
+    protected function ledgerRow(Event $event, Carbon $scheduledAt): SchedulerCatchupLog
+    {
+        $key = ScheduleEventKey::for($event);
+        $slot = $scheduledAt->toDateTimeString();
+
+        $log = SchedulerCatchupLog::firstOrNew(['command' => $key, 'scheduled_at' => $slot]);
+
+        $legacy = $this->ledger['legacyPending'][$key][$slot] ?? null;
+
+        if ($log->exists || $legacy === null) {
+            return $log;
+        }
+
+        unset($this->ledger['legacyPending'][$key][$slot]);
+
+        $legacyLog = SchedulerCatchupLog::query()
+            ->where('command', $legacy)
+            ->where('scheduled_at', $slot)
+            ->first();
+
+        if ($legacyLog === null) {
+            return $log;
+        }
+
+        $legacyLog->command = $key;
+
+        return $legacyLog;
     }
 
     protected function setScheduledTime(Carbon $scheduledAt): void

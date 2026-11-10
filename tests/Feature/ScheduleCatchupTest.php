@@ -7,6 +7,7 @@ use Cyberwizard\ScheduleCatchup\Events\ScheduleCatchupCompleted;
 use Cyberwizard\ScheduleCatchup\Events\ScheduleCatchupFailed;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupCheckpoint;
 use Cyberwizard\ScheduleCatchup\Models\SchedulerCatchupLog;
+use Cyberwizard\ScheduleCatchup\Support\ScheduleEventKey;
 use Cyberwizard\ScheduleCatchup\Tests\TestCase;
 use Illuminate\Console\Events\ScheduledTaskFinished;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -138,7 +139,7 @@ class ScheduleCatchupTest extends TestCase
     public function test_failed_replay_withholds_checkpoint_and_is_retried(): void
     {
         $attempts = [];
-        Schedule::call(function () use (&$attempts): void {
+        $event = Schedule::call(function () use (&$attempts): void {
             $attempts[] = now()->toDateTimeString();
             throw new RuntimeException('boom');
         })->name('test:boom')->everyMinute()->replayOnCatchup();
@@ -155,7 +156,7 @@ class ScheduleCatchupTest extends TestCase
         $this->assertGreaterThan($firstCount, count($attempts));
         $this->assertSame($lastTick, SchedulerCatchupCheckpoint::get('last_tick'));
 
-        $logs = SchedulerCatchupLog::where('command', 'test:boom')->get();
+        $logs = SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))->get();
 
         $this->assertGreaterThan(0, $logs->count());
         $this->assertTrue($logs->every(fn ($log) => $log->exit_code !== 0));
@@ -169,7 +170,7 @@ class ScheduleCatchupTest extends TestCase
         config(['schedule-catchup.max_attempts' => 2]);
 
         $attempts = 0;
-        Schedule::call(function () use (&$attempts): void {
+        $event = Schedule::call(function () use (&$attempts): void {
             $attempts++;
             throw new RuntimeException('boom');
         })->name('test:bounded')->dailyAt('11:57')->replayOnCatchup();
@@ -186,7 +187,7 @@ class ScheduleCatchupTest extends TestCase
         $this->artisan('schedule-catchup:run')->assertExitCode(0);
         $this->assertSame(2, $attempts, 'Exhausted occurrences must not be retried again.');
 
-        $log = SchedulerCatchupLog::where('command', 'test:bounded')->firstOrFail();
+        $log = SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))->firstOrFail();
         $this->assertSame(2, $log->attempts);
         $this->assertTrue($log->isSettled(2));
         $this->assertNotSame($lastTick, SchedulerCatchupCheckpoint::get('last_tick'), 'An exhausted occurrence must stop holding the checkpoint back.');
@@ -207,7 +208,7 @@ class ScheduleCatchupTest extends TestCase
         $this->artisan('schedule-catchup:run')->assertExitCode(0);
 
         $this->assertSame(0, $ran);
-        $owed = SchedulerCatchupLog::where('command', 'test:overlap')->sole();
+        $owed = SchedulerCatchupLog::where('command', ScheduleEventKey::for($event))->sole();
         $this->assertNull($owed->exit_code, 'An overlap skip must not retire the occurrence.');
         $this->assertSame(0, $owed->attempts);
         $this->assertFalse($owed->isSettled(3));
@@ -233,7 +234,7 @@ class ScheduleCatchupTest extends TestCase
         EventFacade::dispatch(new ScheduledTaskFinished($task, 0.5));
 
         $this->assertDatabaseHas('cyber_schedule_catchup_logs', [
-            'command' => 'test:ledger',
+            'command' => ScheduleEventKey::for($task),
             'source' => 'scheduled',
             'exit_code' => 0,
         ]);
